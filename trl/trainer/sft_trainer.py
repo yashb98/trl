@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import inspect
 import json
 import os
 import types
@@ -377,6 +378,7 @@ def _patch_chunked_ce_lm_head(model: torch.nn.Module, chunk_size: int, is_vlm: b
             aux_loss=aux_loss,
         )
 
+    _chunked_ce_forward.__signature__ = inspect.signature(original_forward)
     model.forward = types.MethodType(_chunked_ce_forward, model)
 
 

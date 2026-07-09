@@ -323,6 +323,31 @@ class TestGKDTrainer(TrlTestCase):
         assert trainer.generation_config.temperature == training_args.temperature
         assert trainer.generation_config.top_k == 0
 
+    def test_on_policy_with_multimodal_model(self):
+        """On-policy generation must work when the chunked-CE patch has replaced the model's forward."""
+        model_id = "trl-internal-testing/tiny-Gemma3ForConditionalGeneration"
+        tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+        training_args = GKDConfig(
+            output_dir=self.tmp_dir,
+            lmbda=1.0,
+            max_steps=1,
+            per_device_train_batch_size=2,
+            max_new_tokens=8,
+            report_to="none",
+        )
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
+
+        trainer = GKDTrainer(
+            model=model_id,
+            teacher_model=model_id,
+            args=training_args,
+            train_dataset=dataset["train"],
+            processing_class=tokenizer,
+        )
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
     @require_liger_kernel
     def test_compute_loss_return_outputs_with_liger(self):
         """Test that return_outputs=True works correctly with Liger kernel path."""
