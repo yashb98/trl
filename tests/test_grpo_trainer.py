@@ -394,8 +394,10 @@ class TestGRPOTrainer(TrlTestCase):
         assert type(trainer.model).__name__ == "RemoteForCausalLM"
 
     @pytest.mark.parametrize("use_liger_kernel", [False, pytest.param(True, marks=require_liger_kernel)])
-    @pytest.mark.parametrize("loss_type", ["bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"])
+    @pytest.mark.parametrize("loss_type", ["bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo", "up"])
     def test_train_loss_types(self, loss_type, use_liger_kernel):
+        if loss_type == "up" and use_liger_kernel:
+            pytest.skip("The 'up' loss type is not supported with the Liger kernel yet.")
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = GRPOConfig(
@@ -427,6 +429,135 @@ class TestGRPOTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def _make_up_loss_trainer_and_inputs(self, advantages, importance_sampling_level="token"):
+        """Build a tiny trainer with `loss_type="up"` and a hand-crafted `_compute_loss` inputs dict."""
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def dummy_reward_func(completions, **kwargs):
+            return [0.0] * len(completions)
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            beta=0.0,  # no KL term, so no reference model is needed
+            bf16=False,  # gradients are compared in full fp32 precision
+            per_device_train_batch_size=3,
+            num_generations=3,
+            max_completion_length=8,
+            importance_sampling_level=importance_sampling_level,
+            loss_type="up",
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs=dummy_reward_func,
+            args=training_args,
+            train_dataset=dataset,
+        )
+        device = trainer.accelerator.device
+        generator = torch.Generator().manual_seed(42)
+        vocab_size = trainer.model.config.vocab_size
+        prompt_ids = torch.randint(0, vocab_size, (3, 4), generator=generator).to(device)
+        completion_ids = torch.randint(0, vocab_size, (3, 6), generator=generator).to(device)
+        completion_mask = torch.ones_like(completion_ids)
+        completion_mask[-1, -2:] = 0  # ragged completion lengths, to exercise masking
+        inputs = {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": torch.ones_like(prompt_ids),
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "advantages": advantages.to(device),
+            "num_items_in_batch": completion_mask.sum(),
+        }
+        return trainer, inputs
+
+    def _grads(self, trainer, loss):
+        params = [p for p in trainer.model.parameters() if p.requires_grad]
+        return torch.autograd.grad(loss, params, allow_unused=True)
+
+    @pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
+    def test_up_loss_positive_advantages_match_reinforce_and_ignore_old_logps(self, importance_sampling_level):
+        # For positive advantages, the gradient of the UP loss must equal the plain REINFORCE gradient
+        # Â · ∇ log π_θ (with the same global-token normalization), and must not depend on old_per_token_logps.
+        # This also holds at the sequence level: the global active-token normalization weights each sequence by its
+        # length, which exactly cancels the length normalization of the sequence-level anchored ratio.
+        advantages = torch.tensor([0.3, 1.5, 0.8])  # all positive: every token goes through the UP branch
+        trainer, inputs = self._make_up_loss_trainer_and_inputs(advantages, importance_sampling_level)
+
+        input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
+        attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
+        logits_to_keep = inputs["completion_ids"].size(1)
+        per_token_logps, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model, input_ids, attention_mask, logits_to_keep
+        )
+
+        # Simulate a stale (off-policy) old policy
+        inputs["old_per_token_logps"] = per_token_logps.detach() - 0.7
+        up_loss = trainer._compute_loss(trainer.model, inputs)
+        up_grads = self._grads(trainer, up_loss)
+
+        # REINFORCE reference: -Â · log π_θ, aggregated with the same global-token normalization
+        mask = inputs["completion_mask"]
+        advantages = inputs["advantages"]
+        reinforce_loss = -(advantages.unsqueeze(1) * per_token_logps * mask).sum() / inputs["num_items_in_batch"]
+        reinforce_grads = self._grads(trainer, reinforce_loss)
+
+        for up_grad, reinforce_grad in zip(up_grads, reinforce_grads, strict=True):
+            torch.testing.assert_close(up_grad, reinforce_grad, rtol=1e-6, atol=1e-8)
+
+        # A different old policy must yield the exact same loss and gradients: the UP branch is anchored to
+        # sg(π_θ), not π_old
+        inputs["old_per_token_logps"] = per_token_logps.detach() + 0.9
+        other_loss = trainer._compute_loss(trainer.model, inputs)
+        other_grads = self._grads(trainer, other_loss)
+        assert torch.equal(up_loss.detach(), other_loss.detach())
+        for up_grad, other_grad in zip(up_grads, other_grads, strict=True):
+            assert torch.equal(up_grad, other_grad)
+
+    def test_up_loss_non_positive_advantages_match_dapo(self):
+        # For non-positive advantages, the UP loss must fall back to the clipped surrogate: same loss and same
+        # gradients as loss_type="dapo" (which shares the global-token normalization).
+        advantages = torch.tensor([-0.3, 0.0, -1.2])  # all non-positive: every token goes through the clipped branch
+        trainer, inputs = self._make_up_loss_trainer_and_inputs(advantages)
+
+        input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
+        attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
+        logits_to_keep = inputs["completion_ids"].size(1)
+        per_token_logps, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model, input_ids, attention_mask, logits_to_keep
+        )
+        # Stale old policy, shifted enough for some ratios to be clipped and others not
+        generator = torch.Generator().manual_seed(0)
+        shift = torch.empty(per_token_logps.shape).uniform_(-0.5, 0.5, generator=generator)
+        inputs["old_per_token_logps"] = per_token_logps.detach() + shift.to(per_token_logps.device)
+
+        up_loss = trainer._compute_loss(trainer.model, inputs)
+        up_grads = self._grads(trainer, up_loss)
+
+        trainer.loss_type = "dapo"
+        dapo_loss = trainer._compute_loss(trainer.model, inputs)
+        dapo_grads = self._grads(trainer, dapo_loss)
+
+        assert torch.equal(up_loss.detach(), dapo_loss.detach())
+        for up_grad, dapo_grad in zip(up_grads, dapo_grads, strict=True):
+            assert torch.equal(up_grad, dapo_grad)
+
+    def test_up_loss_not_supported_with_liger_kernel(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            bf16=False,
+            loss_type="up",
+            use_liger_kernel=True,
+            report_to="none",
+        )
+        with pytest.raises(NotImplementedError, match="'up' loss type is not supported"):
+            GRPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+                args=training_args,
+                train_dataset=dataset,
+            )
 
     def test_train_with_eval(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")

@@ -272,6 +272,14 @@ class GRPOConfig(_BaseConfig):
             - `"vespo"`: Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth,
               asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in
               the [VESPO paper](https://huggingface.co/papers/2602.10693).
+            - `"up"`: Unbounded Positive asymmetric optimization, introduced in the [UP
+              paper](https://huggingface.co/papers/2607.06987). Tokens with positive advantage bypass clipping
+              entirely: the importance sampling ratio is replaced by the self-anchored ratio `πθ / sg(πθ)`, whose
+              value is `1` and whose gradient is the unclipped REINFORCE gradient `Â ∇ log πθ`, independent of the
+              old policy. Tokens with non-positive advantage keep the standard clipped surrogate as a safeguard
+              against aggressive penalization (only the lower bound `epsilon` can bind for non-positive advantages,
+              so `epsilon_high` has no effect with this loss). Individual token losses are aggregated by normalizing
+              with the number of active tokens in the global accumulated batch, like `"dapo"`.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -821,6 +829,14 @@ class GRPOConfig(_BaseConfig):
             "'vespo': Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth, "
             "asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in "
             "the [VESPO paper](https://huggingface.co/papers/2602.10693)."
+            "'up': Unbounded Positive asymmetric optimization, introduced in the [UP "
+            "paper](https://huggingface.co/papers/2607.06987). Tokens with positive advantage bypass clipping "
+            "entirely: the importance sampling ratio is replaced by the self-anchored ratio `πθ / sg(πθ)`, whose "
+            "value is `1` and whose gradient is the unclipped REINFORCE gradient `Â ∇ log πθ`, independent of the "
+            "old policy. Tokens with non-positive advantage keep the standard clipped surrogate as a safeguard "
+            "against aggressive penalization (only the lower bound `epsilon` can bind for non-positive advantages, "
+            "so `epsilon_high` has no effect with this loss). Individual token losses are aggregated by normalizing "
+            "with the number of active tokens in the global accumulated batch, like 'dapo'."
         },
     )
     mask_truncated_completions: bool = field(

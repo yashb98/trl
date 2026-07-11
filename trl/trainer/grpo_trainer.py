@@ -805,6 +805,10 @@ class GRPOTrainer(_BaseTrainer):
                     "wrong sequence. Use a weight-based adapter such as LoRA instead, or set "
                     "`use_liger_kernel=False`."
                 )
+        if self.use_liger_kernel and args.loss_type == "up":
+            raise NotImplementedError(
+                "The 'up' loss type is not supported with `use_liger_kernel=True` yet. Set `use_liger_kernel=False`."
+            )
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
         if self.use_liger_kernel and self.top_entropy_quantile < 1.0:
@@ -876,6 +880,14 @@ class GRPOTrainer(_BaseTrainer):
             logger.warning(
                 "VESPO computes sequence-level importance weights internally. `importance_sampling_level` should be "
                 "set to `'token'` (the default)."
+            )
+
+        if args.loss_type == "up" and args.importance_sampling_level == "sequence":
+            logger.warning(
+                "When using the `'up'` loss with `importance_sampling_level='sequence'`, the positive branch follows "
+                "the sequence-level UP objective (UP-GSPO), but token losses are still aggregated with the global "
+                "active-token normalization (like `'dapo'`), which weights each sequence by its completion length "
+                "instead of averaging per-sequence losses as in the UP paper's UP-GSPO setup."
             )
 
         if args.importance_sampling_level == "sequence" and args.loss_type in ["bnpo", "dr_grpo", "dapo", "cispo"]:
@@ -3075,6 +3087,26 @@ class GRPOTrainer(_BaseTrainer):
                 lambda_neg=self.args.vespo_lambda_neg,
             )
             per_token_loss = -phi_seq * advantages * per_token_logps
+        elif self.loss_type == "up":
+            # UP (https://huggingface.co/papers/2607.06987) asymmetric objective. Tokens with positive advantage
+            # bypass clipping entirely: the importance sampling ratio is replaced by the self-anchored ratio
+            # πθ / sg(πθ), whose value is 1 and whose gradient is the unclipped REINFORCE gradient Â ∇ log πθ,
+            # independent of the old policy (Eqs. 12-14). Tokens with non-positive advantage keep the standard
+            # clipped surrogate as a safeguard against aggressive penalization.
+            if self.importance_sampling_level == "token":
+                anchored_log_ratio = per_token_logps - per_token_logps.detach()
+            else:  # "sequence": length-normalized sequence-level ratio, i.e. the UP-GSPO positive branch (Eq. 16)
+                anchored_log_ratio = ((per_token_logps - per_token_logps.detach()) * mask).sum(-1) / mask.sum(
+                    -1
+                ).clamp(min=1.0)
+                anchored_log_ratio = anchored_log_ratio.unsqueeze(-1)
+            up_per_token_loss = -anchored_log_ratio.exp() * advantages
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            # Two-sided clipping
+            if self.args.delta is not None:
+                coef_1 = torch.clamp(coef_1, max=self.args.delta)
+            clipped_per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+            per_token_loss = torch.where(advantages > 0, up_per_token_loss, clipped_per_token_loss)
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
@@ -3106,7 +3138,7 @@ class GRPOTrainer(_BaseTrainer):
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
             policy_loss = loss.detach()
             loss = loss / normalizer
-        elif self.loss_type in ["cispo", "dapo", "vespo"]:
+        elif self.loss_type in ["cispo", "dapo", "vespo", "up"]:
             normalizer = inputs["num_items_in_batch"].clamp(min=1.0) / self.accelerator.num_processes
             loss = (per_token_loss * mask).sum() / normalizer
             policy_loss = loss.detach()
@@ -3130,8 +3162,8 @@ class GRPOTrainer(_BaseTrainer):
             # H does not depend on how each loss type normalizes its policy term. The term is computed so that
             # it accumulates to H over the optimizer step for every loss type and matches world_entropy below.
             # The only wrinkle is the normalizer: most loss types divide by the gradient accumulation step
-            # count, but cispo/dapo/vespo divide by a global token count.
-            if self.loss_type in ["cispo", "dapo", "vespo"]:
+            # count, but cispo/dapo/vespo/up divide by a global token count.
+            if self.loss_type in ["cispo", "dapo", "vespo", "up"]:
                 # normalizer is a global token count, so summing the entropies (instead of averaging them
                 # again) makes the term accumulate over the optimizer step to the global mean per-token
                 # entropy, like the other loss types.
@@ -3224,6 +3256,14 @@ class GRPOTrainer(_BaseTrainer):
             self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
             gathered_clip_ratio = self.accelerator.gather(clip_ratio)
             self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        elif self.loss_type == "up":
+            # Only the negative-advantage branch of UP is clipped (the positive branch is unbounded by design), so
+            # only the low-side clip ratio is meaningful.
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+            low_clip = masked_batch_mean(is_low_clipped.float())
+            gathered_low_clip = self.accelerator.gather(low_clip)
+            self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
+            self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
         elif self.loss_type == "cispo":
             is_cispo_clipped = (coef_1 > self.epsilon_high) & (advantages > 0)
             cispo_clip_ratio = masked_batch_mean(is_cispo_clipped.float())
