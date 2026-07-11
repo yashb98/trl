@@ -684,6 +684,36 @@ training_args = GRPOConfig(
 )
 ```
 
+### UP: Unbounded Positive Asymmetric Optimization for Breaking the Exploration-Stability Dilemma
+
+**📜 Paper**: https://huggingface.co/papers/2607.06987
+
+Unbounded Positive Asymmetric Optimization (UP) addresses the exploration-stability dilemma of clipped surrogate objectives: clipping stabilizes training but prematurely truncates the update budget of correct but low-confidence tokens. UP routes tokens asymmetrically based on the sign of the advantage. For positive advantages, the importance sampling ratio is replaced by a self-anchored ratio whose denominator is the current policy under a stop-gradient. Its value is exactly 1 and its gradient is the unclipped REINFORCE gradient, independent of the old policy. For non-positive advantages, the standard clipped surrogate is kept as a safeguard.
+
+$$
+\mathcal{L}_{\text{UP}}(\theta) = -\frac{1}{\sum_{i=1}^G |o_i|} \sum_{i=1}^G \sum_{t=1}^{|o_i|}
+\begin{cases}
+\hat{A}_{i,t} \, \dfrac{\pi_\theta(o_{i,t} \mid q, o_{i,<t})}{\operatorname{sg}\!\left[\pi_\theta(o_{i,t} \mid q, o_{i,<t})\right]} & \text{if } \hat{A}_{i,t} > 0 \\
+\min \left( r_{i,t}(\theta) \hat{A}_{i,t},\ \operatorname{clip}\!\left(r_{i,t}(\theta), 1 - \epsilon_{\text{low}}, 1 + \epsilon_{\text{high}}\right) \hat{A}_{i,t} \right) & \text{if } \hat{A}_{i,t} \le 0
+\end{cases}
+$$
+
+To use UP as in the paper's token-level UP-DAPO setup:
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    loss_type="up",
+    epsilon=0.2,  # lower clip bound, only applies to the negative-advantage branch
+    beta=0.0,
+)
+```
+
+Note that the upper clip bound (`epsilon_high`) has no effect with this loss: positive advantages bypass clipping entirely, and the upper bound never binds for non-positive advantages (Table A1 of the paper accordingly reports no `ϵ_high` for UP-DAPO). The lower bound `epsilon` and the optional two-sided cap `delta` both still apply to the non-positive branch.
+
+The paper's UP-DAPO setup uses `beta=0.0` at 14B. At smaller scale, consider keeping a KL term (`beta > 0`), as the paper's UP-GRPO variant does.
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
